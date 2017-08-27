@@ -49,14 +49,14 @@ extern crate trust_dns;
 use std::cell::RefCell;
 use std::env;
 use std::io::{self, Read, Write};
-use std::net::{Shutdown, IpAddr};
+use std::net::IpAddr;
 use std::net::{SocketAddr, Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 use std::rc::Rc;
 use std::str;
 use std::time::Duration;
 
 use futures::future;
-use futures::{Future, Stream, Poll, Async};
+use futures::{Future, Stream, Poll};
 use tokio_io::io::{read_exact, write_all, Window};
 use tokio_core::net::{TcpStream, TcpListener};
 use tokio_core::reactor::{Core, Handle, Timeout};
@@ -77,7 +77,7 @@ fn main() {
     // Here we create the event loop, the global buffer that all threads will
     // read/write into, and the bound TCP listener itself.
     let mut lp = Core::new().unwrap();
-    let buffer = Rc::new(RefCell::new(vec![0; 64 * 1024]));
+    let buffer = Rc::new(RefCell::new(vec![0; 2 * 1024]));
     let handle = lp.handle();
     let listener = TcpListener::bind(&addr, &handle).unwrap();
 
@@ -515,6 +515,9 @@ struct Transfer {
 
     // The number of bytes we've written so far.
     amt: u64,
+    pos: usize,
+    cap: usize,
+    read_done: bool,
 }
 
 impl Transfer {
@@ -525,7 +528,10 @@ impl Transfer {
             reader: reader,
             writer: writer,
             buf: buffer,
+            read_done: false,
             amt: 0,
+            cap: 0,
+            pos: 0,
         }
     }
 }
@@ -554,6 +560,8 @@ impl Future for Transfer {
     /// point.
     fn poll(&mut self) -> Poll<u64, io::Error> {
         let mut buffer = self.buf.borrow_mut();
+        let mut reader = &*self.reader;
+        let mut writer = &*self.writer;
 
         // Here we loop over the two TCP halves, reading all data from one
         // connection and writing it to another. The crucial performance aspect
@@ -561,53 +569,37 @@ impl Future for Transfer {
         // the write half are ready on the connection, allowing the buffer to
         // only be temporarily used in a small window for all connections.
         loop {
-            let read_ready = self.reader.poll_read().is_ready();
-            let write_ready = self.writer.poll_write().is_ready();
-            if !read_ready || !write_ready {
-                return Ok(Async::NotReady)
+            // If our buffer is empty, then we need to read some data to
+            // continue.
+            if self.pos == self.cap && !self.read_done {
+                let n = try_nb!(reader.read(&mut buffer));
+                if n == 0 {
+                    self.read_done = true;
+                } else {
+                    self.pos = 0;
+                    self.cap = n;
+                }
             }
 
-            // TODO: This exact logic for reading/writing amounts may need an
-            //       update
-            //
-            // Right now the `buffer` is actually pretty big, 64k, and it could
-            // be the case that one end of the connection can far outpace
-            // another. For example we may be able to always read 64k from the
-            // read half but only be able to write 5k to the client. This is a
-            // pretty bad situation because we've got data in a buffer that's
-            // intended to be ephemeral!
-            //
-            // Ideally here we'd actually adapt the rate of reads to match the
-            // rate of writes. That is, we'd prefer to have some form of
-            // adaptive algorithm which keeps track of how many bytes are
-            // written and match the read rate to the write rate. It's possible
-            // for connections to have an even smaller (and optional) buffer on
-            // the side representing the "too much data they read" if that
-            // happens, and then the next call to `read` could compensate by not
-            // reading so much again.
-            //
-            // In any case, though, this is easily implementable in terms of
-            // adding fields to `Transfer` and is complicated enough to
-            // otherwise detract from the example in question here. As a result,
-            // we simply read into the global buffer and then assert that we
-            // write out exactly the same amount.
-            //
-            // This means that we may trip the assert below, but it should be
-            // relatively easily fixable with the strategy above!
-
-            let n = try_nb!((&*self.reader).read(&mut buffer));
-            if n == 0 {
-                try!(self.writer.shutdown(Shutdown::Write));
-                return Ok(self.amt.into())
+            // If our buffer has some data, let's write it out!
+            while self.pos < self.cap {
+                let i = try_nb!(writer.write(&buffer[self.pos..self.cap]));
+                if i == 0 {
+                    return Err(io::Error::new(io::ErrorKind::WriteZero,
+                                              "write zero byte into writer"));
+                } else {
+                    self.pos += i;
+                    self.amt += i as u64;
+                }
             }
-            self.amt += n as u64;
 
-            // Unlike above, we don't handle `WouldBlock` specially, because
-            // that would play into the logic mentioned above (tracking read
-            // rates and write rates), so we just ferry along that error for
-            // now.
-            let m = try!((&*self.writer).write(&buffer[..n]));
-            assert_eq!(n, m);
+            // If we've written al the data and we've seen EOF, flush out the
+            // data and finish the transfer.
+            // done with the entire transfer.
+            if self.pos == self.cap && self.read_done {
+                try_nb!(writer.flush());
+                return Ok(self.amt.into());
+            }
         }
     }
 }
